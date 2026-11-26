@@ -3,41 +3,70 @@ const http = require('http');
 const { Server } = require('socket.io');
 
 const app = express();
-app.get('/', (req, res) => res.send('Real Tournament : serveur en ligne'));
+
+app.get('/', (req, res) => {
+  res.send('Real Tournament : serveur en ligne');
+});
 
 const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
 
-// Délai entre deux pings radar (en millisecondes). 60000 = 1 minute.
+const io = new Server(server, {
+  cors: { origin: '*' },
+});
+
 const PING_INTERVAL_MS = 60000;
+const GAME_DURATION_MS = 15 * 60 * 1000;
 
-// Les salons en mémoire : { "ZONE-A": { players: {...}, timer: ... } }
-const rooms = {};
+const rooms = Object.create(null);
 
 function getRoom(code) {
   if (!rooms[code]) {
-    rooms[code] = { players: {}, timer: null };
-    rooms[code].timer = setInterval(() => sendRadarPing(code), PING_INTERVAL_MS);
+    rooms[code] = {
+      players: {},
+      radarTimer: null,
+      gameTimer: null,
+      gameStatus: 'waiting',
+      gameEndTime: null,
+    };
+
+    rooms[code].radarTimer = setInterval(() => {
+      sendRadarPing(code);
+    }, PING_INTERVAL_MS);
   }
+
   return rooms[code];
 }
 
 function publicPlayers(room) {
-  return Object.entries(room.players).map(([id, p]) => ({
+  return Object.entries(room.players).map(([id, player]) => ({
     id,
-    name: p.name,
-    role: p.role,
+    name: player.name,
+    role: player.role,
   }));
 }
 
-// Envoie la position des fugitifs uniquement aux chasseurs
+function gameState(room) {
+  return {
+    status: room.gameStatus,
+    endTime: room.gameEndTime,
+    serverTime: Date.now(),
+  };
+}
+
 function sendRadarPing(code) {
   const room = rooms[code];
   if (!room) return;
 
   const runners = Object.entries(room.players)
-    .filter(([, p]) => p.role === 'RUNNER' && p.lat !== null)
-    .map(([id, p]) => ({ id, name: p.name, lat: p.lat, lng: p.lng }));
+    .filter(([, player]) => {
+      return player.role === 'RUNNER' && player.lat !== null;
+    })
+    .map(([id, player]) => ({
+      id,
+      name: player.name,
+      lat: player.lat,
+      lng: player.lng,
+    }));
 
   console.log(`[${code}] Ping radar : ${runners.length} fugitif(s)`);
   io.to(code + ':HUNTER').emit('radar_ping', runners);
@@ -46,52 +75,124 @@ function sendRadarPing(code) {
 io.on('connection', (socket) => {
   console.log(`Connexion : ${socket.id}`);
 
-  // Un joueur rejoint un salon
-  socket.on('join_room', ({ code, name, role }) => {
+  socket.on('join_room', (data) => {
+    if (
+      !data ||
+      typeof data.code !== 'string' ||
+      typeof data.name !== 'string' ||
+      !['HUNTER', 'RUNNER'].includes(data.role)
+    ) {
+      return;
+    }
+
+    const { code, name, role } = data;
+
+    if (!code.trim() || !name.trim() || socket.data.code) return;
+
     const room = getRoom(code);
+
     socket.data.code = code;
     socket.join(code);
     socket.join(code + ':' + role);
-    room.players[socket.id] = { name, role, lat: null, lng: null };
+
+    room.players[socket.id] = {
+      name,
+      role,
+      lat: null,
+      lng: null,
+    };
 
     io.to(code).emit('players', publicPlayers(room));
+
+    // Un joueur qui rejoint reçoit l'état actuel de la partie.
+    socket.emit('game_state', gameState(room));
+
     console.log(`${name} (${role}) a rejoint ${code}`);
   });
 
-  // Un joueur envoie sa position
-  socket.on('location', ({ lat, lng }) => {
+  socket.on('start_game', () => {
+    const code = socket.data.code;
+    if (!code || !rooms[code]) return;
+
+    const room = rooms[code];
+    if (!room.players[socket.id]) return;
+
+    // Ne remet pas le chrono à zéro si une partie est déjà lancée.
+    if (room.gameStatus === 'running') {
+      socket.emit('game_state', gameState(room));
+      return;
+    }
+
+    if (room.gameTimer) {
+      clearTimeout(room.gameTimer);
+    }
+
+    room.gameStatus = 'running';
+    room.gameEndTime = Date.now() + GAME_DURATION_MS;
+
+    io.to(code).emit('game_state', gameState(room));
+
+    room.gameTimer = setTimeout(() => {
+      if (rooms[code] !== room) return;
+
+      room.gameStatus = 'finished';
+      room.gameTimer = null;
+
+      io.to(code).emit('game_state', gameState(room));
+      console.log(`[${code}] Temps écoulé`);
+    }, GAME_DURATION_MS);
+
+    console.log(`[${code}] Partie lancée pour 15 minutes`);
+  });
+
+  socket.on('location', (data) => {
+    if (
+      !data ||
+      !Number.isFinite(data.lat) ||
+      !Number.isFinite(data.lng) ||
+      data.lat < -90 ||
+      data.lat > 90 ||
+      data.lng < -180 ||
+      data.lng > 180
+    ) {
+      return;
+    }
+
     const code = socket.data.code;
     if (!code || !rooms[code]) return;
 
     const player = rooms[code].players[socket.id];
     if (!player) return;
 
-    player.lat = lat;
-    player.lng = lng;
+    player.lat = data.lat;
+    player.lng = data.lng;
 
-    // Les chasseurs se voient entre eux en direct
     if (player.role === 'HUNTER') {
       io.to(code + ':HUNTER').emit('hunter_moved', {
         id: socket.id,
         name: player.name,
-        lat,
-        lng,
+        lat: data.lat,
+        lng: data.lng,
       });
     }
   });
 
-  // Un joueur quitte ou ferme l'application
   socket.on('disconnect', () => {
     const code = socket.data.code;
     if (!code || !rooms[code]) return;
 
     const room = rooms[code];
     delete room.players[socket.id];
+
     io.to(code).emit('players', publicPlayers(room));
 
-    // Si le salon est vide, on le supprime pour libérer la mémoire
     if (Object.keys(room.players).length === 0) {
-      clearInterval(room.timer);
+      clearInterval(room.radarTimer);
+
+      if (room.gameTimer) {
+        clearTimeout(room.gameTimer);
+      }
+
       delete rooms[code];
       console.log(`Salon ${code} fermé (vide)`);
     }
@@ -99,6 +200,7 @@ io.on('connection', (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
+
 server.listen(PORT, () => {
   console.log(`Serveur Real Tournament en écoute sur le port ${PORT}`);
 });
