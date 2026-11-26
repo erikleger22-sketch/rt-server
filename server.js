@@ -10,11 +10,10 @@ const io = new Server(server, { cors: { origin: '*' } });
 
 const PING_INTERVAL_MS = 60000;
 const GAME_DURATION_MS = 15 * 60 * 1000;
-const CAPTURE_DISTANCE_METERS = 25; // Rayon de capture en mètres
+const CAPTURE_DISTANCE_METERS = 25;
 
 const rooms = Object.create(null);
 
-// Calcul de distance GPS en mètres (formule Haversine)
 function getDistanceMeters(lat1, lon1, lat2, lon2) {
   const R = 6371e3;
   const rad = Math.PI / 180;
@@ -34,7 +33,7 @@ function getRoom(code) {
       players: {},
       radarTimer: null,
       gameTimer: null,
-      gameStatus: 'waiting', // waiting, running, finished
+      gameStatus: 'waiting',
       gameEndTime: null,
       winner: null,
     };
@@ -71,7 +70,6 @@ function checkWinCondition(code) {
   const runners = Object.values(room.players).filter(p => p.role === 'RUNNER');
   const aliveRunners = runners.filter(p => !p.captured);
 
-  // S'il y a des fugitifs dans la partie et qu'ils sont TOUS capturés :
   if (runners.length > 0 && aliveRunners.length === 0) {
     if (room.gameTimer) clearTimeout(room.gameTimer);
     room.gameStatus = 'finished';
@@ -100,6 +98,8 @@ function sendRadarPing(code) {
 }
 
 io.on('connection', (socket) => {
+  console.log(`Connexion : ${socket.id}`);
+
   socket.on('join_room', ({ code, name, role }) => {
     if (!code || !name) return;
     const room = getRoom(code);
@@ -118,6 +118,7 @@ io.on('connection', (socket) => {
 
     io.to(code).emit('players', publicPlayers(room));
     socket.emit('game_state', gameState(room));
+    console.log(`${name} (${role}) a rejoint ${code}`);
   });
 
   socket.on('start_game', () => {
@@ -125,7 +126,6 @@ io.on('connection', (socket) => {
     if (!code || !rooms[code]) return;
     const room = rooms[code];
 
-    // Réinitialiser les captures
     Object.values(room.players).forEach(p => p.captured = false);
     if (room.gameTimer) clearTimeout(room.gameTimer);
 
@@ -140,10 +140,12 @@ io.on('connection', (socket) => {
     room.gameTimer = setTimeout(() => {
       if (rooms[code] !== room) return;
       room.gameStatus = 'finished';
-      room.winner = 'RUNNERS'; // Les fugitifs ont survécu au chrono
+      room.winner = 'RUNNERS';
       io.to(code).emit('game_state', gameState(room));
       io.to(code).emit('announcement', '🏆 TEMPS ÉCOULÉ ! VICTOIRE DES FUGITIFS !');
     }, GAME_DURATION_MS);
+
+    console.log(`[${code}] Traque lancée pour 15 min`);
   });
 
   socket.on('location', ({ lat, lng }) => {
@@ -165,7 +167,6 @@ io.on('connection', (socket) => {
     }
   });
 
-  // TENTATIVE D'ARRESTATION PAR UN CHASSEUR
   socket.on('attempt_capture', () => {
     const code = socket.data.code;
     if (!code || !rooms[code]) return;
@@ -182,7 +183,6 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Chercher le fugitif le plus proche non encore capturé
     let capturedRunner = null;
     let closestDist = Infinity;
 
@@ -196,4 +196,42 @@ io.on('connection', (socket) => {
       }
     }
 
-    if 
+    if (capturedRunner) {
+      capturedRunner.runner.captured = true;
+      const d = Math.round(closestDist);
+
+      io.to(code).emit('players', publicPlayers(room));
+      io.to(code).emit('announcement', `🚨 ${hunter.name} a CAPTURÉ ${capturedRunner.runner.name} à ${d}m !`);
+      socket.emit('capture_result', { success: true, message: `Cible ${capturedRunner.runner.name} capturée !` });
+
+      checkWinCondition(code);
+    } else {
+      socket.emit('capture_result', {
+        success: false,
+        message: 'Échec : aucun fugitif à moins de 25 mètres !',
+      });
+    }
+  });
+
+  socket.on('disconnect', () => {
+    const code = socket.data.code;
+    if (!code || !rooms[code]) return;
+    const room = rooms[code];
+    delete room.players[socket.id];
+    io.to(code).emit('players', publicPlayers(room));
+
+    if (Object.keys(room.players).length === 0) {
+      clearInterval(room.radarTimer);
+      if (room.gameTimer) clearTimeout(room.gameTimer);
+      delete rooms[code];
+      console.log(`Salon ${code} fermé`);
+    } else {
+      checkWinCondition(code);
+    }
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Serveur Real Tournament en écoute sur le port ${PORT}`);
+});
