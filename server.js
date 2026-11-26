@@ -3,21 +3,30 @@ const http = require('http');
 const { Server } = require('socket.io');
 
 const app = express();
-
-app.get('/', (req, res) => {
-  res.send('Real Tournament : serveur en ligne');
-});
+app.get('/', (req, res) => res.send('Real Tournament : serveur en ligne'));
 
 const server = http.createServer(app);
-
-const io = new Server(server, {
-  cors: { origin: '*' },
-});
+const io = new Server(server, { cors: { origin: '*' } });
 
 const PING_INTERVAL_MS = 60000;
 const GAME_DURATION_MS = 15 * 60 * 1000;
+const CAPTURE_DISTANCE_METERS = 25; // Rayon de capture en mètres
 
 const rooms = Object.create(null);
+
+// Calcul de distance GPS en mètres (formule Haversine)
+function getDistanceMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371e3;
+  const rad = Math.PI / 180;
+  const dLat = (lat2 - lat1) * rad;
+  const dLon = (lon2 - lon1) * rad;
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * rad) * Math.cos(lat2 * rad) *
+    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
 
 function getRoom(code) {
   if (!rooms[code]) {
@@ -25,23 +34,24 @@ function getRoom(code) {
       players: {},
       radarTimer: null,
       gameTimer: null,
-      gameStatus: 'waiting',
+      gameStatus: 'waiting', // waiting, running, finished
       gameEndTime: null,
+      winner: null,
     };
 
     rooms[code].radarTimer = setInterval(() => {
       sendRadarPing(code);
     }, PING_INTERVAL_MS);
   }
-
   return rooms[code];
 }
 
 function publicPlayers(room) {
-  return Object.entries(room.players).map(([id, player]) => ({
+  return Object.entries(room.players).map(([id, p]) => ({
     id,
-    name: player.name,
-    role: player.role,
+    name: p.name,
+    role: p.role,
+    captured: p.captured || false,
   }));
 }
 
@@ -50,7 +60,26 @@ function gameState(room) {
     status: room.gameStatus,
     endTime: room.gameEndTime,
     serverTime: Date.now(),
+    winner: room.winner,
   };
+}
+
+function checkWinCondition(code) {
+  const room = rooms[code];
+  if (!room || room.gameStatus !== 'running') return;
+
+  const runners = Object.values(room.players).filter(p => p.role === 'RUNNER');
+  const aliveRunners = runners.filter(p => !p.captured);
+
+  // S'il y a des fugitifs dans la partie et qu'ils sont TOUS capturés :
+  if (runners.length > 0 && aliveRunners.length === 0) {
+    if (room.gameTimer) clearTimeout(room.gameTimer);
+    room.gameStatus = 'finished';
+    room.winner = 'HUNTERS';
+    io.to(code).emit('game_state', gameState(room));
+    io.to(code).emit('announcement', '🏆 VICTOIRE DES CHASSEURS ! Tous les fugitifs ont été capturés.');
+    console.log(`[${code}] Victoire des Chasseurs !`);
+  }
 }
 
 function sendRadarPing(code) {
@@ -58,37 +87,21 @@ function sendRadarPing(code) {
   if (!room) return;
 
   const runners = Object.entries(room.players)
-    .filter(([, player]) => {
-      return player.role === 'RUNNER' && player.lat !== null;
-    })
-    .map(([id, player]) => ({
+    .filter(([, p]) => p.role === 'RUNNER' && !p.captured && p.lat !== null)
+    .map(([id, p]) => ({
       id,
-      name: player.name,
-      lat: player.lat,
-      lng: player.lng,
+      name: p.name,
+      lat: p.lat,
+      lng: p.lng,
     }));
 
-  console.log(`[${code}] Ping radar : ${runners.length} fugitif(s)`);
+  console.log(`[${code}] Ping radar : ${runners.length} fugitif(s) actif(s)`);
   io.to(code + ':HUNTER').emit('radar_ping', runners);
 }
 
 io.on('connection', (socket) => {
-  console.log(`Connexion : ${socket.id}`);
-
-  socket.on('join_room', (data) => {
-    if (
-      !data ||
-      typeof data.code !== 'string' ||
-      typeof data.name !== 'string' ||
-      !['HUNTER', 'RUNNER'].includes(data.role)
-    ) {
-      return;
-    }
-
-    const { code, name, role } = data;
-
-    if (!code.trim() || !name.trim() || socket.data.code) return;
-
+  socket.on('join_room', ({ code, name, role }) => {
+    if (!code || !name) return;
     const room = getRoom(code);
 
     socket.data.code = code;
@@ -100,107 +113,87 @@ io.on('connection', (socket) => {
       role,
       lat: null,
       lng: null,
+      captured: false,
     };
 
     io.to(code).emit('players', publicPlayers(room));
-
-    // Un joueur qui rejoint reçoit l'état actuel de la partie.
     socket.emit('game_state', gameState(room));
-
-    console.log(`${name} (${role}) a rejoint ${code}`);
   });
 
   socket.on('start_game', () => {
     const code = socket.data.code;
     if (!code || !rooms[code]) return;
-
     const room = rooms[code];
-    if (!room.players[socket.id]) return;
 
-    // Ne remet pas le chrono à zéro si une partie est déjà lancée.
-    if (room.gameStatus === 'running') {
-      socket.emit('game_state', gameState(room));
-      return;
-    }
-
-    if (room.gameTimer) {
-      clearTimeout(room.gameTimer);
-    }
+    // Réinitialiser les captures
+    Object.values(room.players).forEach(p => p.captured = false);
+    if (room.gameTimer) clearTimeout(room.gameTimer);
 
     room.gameStatus = 'running';
+    room.winner = null;
     room.gameEndTime = Date.now() + GAME_DURATION_MS;
 
+    io.to(code).emit('players', publicPlayers(room));
     io.to(code).emit('game_state', gameState(room));
+    io.to(code).emit('announcement', '⚡ LA TRAQUE COMMENCE ! Durée : 15 minutes.');
 
     room.gameTimer = setTimeout(() => {
       if (rooms[code] !== room) return;
-
       room.gameStatus = 'finished';
-      room.gameTimer = null;
-
+      room.winner = 'RUNNERS'; // Les fugitifs ont survécu au chrono
       io.to(code).emit('game_state', gameState(room));
-      console.log(`[${code}] Temps écoulé`);
+      io.to(code).emit('announcement', '🏆 TEMPS ÉCOULÉ ! VICTOIRE DES FUGITIFS !');
     }, GAME_DURATION_MS);
-
-    console.log(`[${code}] Partie lancée pour 15 minutes`);
   });
 
-  socket.on('location', (data) => {
-    if (
-      !data ||
-      !Number.isFinite(data.lat) ||
-      !Number.isFinite(data.lng) ||
-      data.lat < -90 ||
-      data.lat > 90 ||
-      data.lng < -180 ||
-      data.lng > 180
-    ) {
-      return;
-    }
-
+  socket.on('location', ({ lat, lng }) => {
     const code = socket.data.code;
     if (!code || !rooms[code]) return;
-
     const player = rooms[code].players[socket.id];
     if (!player) return;
 
-    player.lat = data.lat;
-    player.lng = data.lng;
+    player.lat = lat;
+    player.lng = lng;
 
     if (player.role === 'HUNTER') {
       io.to(code + ':HUNTER').emit('hunter_moved', {
         id: socket.id,
         name: player.name,
-        lat: data.lat,
-        lng: data.lng,
+        lat,
+        lng,
       });
     }
   });
 
-  socket.on('disconnect', () => {
+  // TENTATIVE D'ARRESTATION PAR UN CHASSEUR
+  socket.on('attempt_capture', () => {
     const code = socket.data.code;
     if (!code || !rooms[code]) return;
-
     const room = rooms[code];
-    delete room.players[socket.id];
+    const hunter = room.players[socket.id];
 
-    io.to(code).emit('players', publicPlayers(room));
-
-    if (Object.keys(room.players).length === 0) {
-      clearInterval(room.radarTimer);
-
-      if (room.gameTimer) {
-        clearTimeout(room.gameTimer);
-      }
-
-      delete rooms[code];
-      console.log(`Salon ${code} fermé (vide)`);
+    if (!hunter || hunter.role !== 'HUNTER' || hunter.lat === null) {
+      socket.emit('capture_result', { success: false, message: 'Position GPS invalide.' });
+      return;
     }
-  });
-});
 
-const PORT = process.env.PORT || 3000;
+    if (room.gameStatus !== 'running') {
+      socket.emit('capture_result', { success: false, message: 'La partie n\'est pas en cours.' });
+      return;
+    }
 
-server.listen(PORT, () => {
-  console.log(`Serveur Real Tournament en écoute sur le port ${PORT}`);
-});
+    // Chercher le fugitif le plus proche non encore capturé
+    let capturedRunner = null;
+    let closestDist = Infinity;
+
+    for (const [id, runner] of Object.entries(room.players)) {
+      if (runner.role === 'RUNNER' && !runner.captured && runner.lat !== null) {
+        const dist = getDistanceMeters(hunter.lat, hunter.lng, runner.lat, runner.lng);
+        if (dist <= CAPTURE_DISTANCE_METERS && dist < closestDist) {
+          closestDist = dist;
+          capturedRunner = { id, runner };
+        }
+      }
+    }
+
+    if 
